@@ -1,73 +1,102 @@
-# Mini Studio Architecture
+# Mini Studio — System Architecture (Reviewed)
 
-This document outlines the high-level architecture and component responsibilities for the Mini Studio backend.
+This document is a reviewed, clearer representation of the system architecture derived from `mini_studio_architecture_fixed.drawio`. It describes components, data flows (upload → training → deploy → inference), deployment topology, scaling patterns, failure modes, and recommended improvements.
 
-Overview
+Summary
 
-Mini Studio is a backend service (FastAPI) that provides dataset management, fine-tuning job orchestration, and model deployment/inference for open-source LLMs. The system is designed to work both locally and in distributed/clustered environments (Ray for training, Kubernetes for serving).
+Mini Studio is a microservice-style FastAPI backend that orchestrates dataset management, fine-tuning workloads (Ray), model artifact storage (DFS + S3), and model serving on Kubernetes (vLLM-based containers). The backend persists metadata and routing in MongoDB and caches per-client configuration in Redis. Logging is structured (daily JSON files) and middleware captures request/response lifecycle.
 
-Primary components
+Core components
 
-- API & Lifespan (main.py)
-  - FastAPI app with a lifespan context manager that connects to MongoDB and Redis on startup and closes connections on shutdown.
-  - Global middleware: CORS, GZip and structured request/response logging.
+- API (FastAPI)
+  - Entrypoint for dataset uploads, job submission, model deployment, and inference proxying.
+  - Lifespan hooks connect MongoDB and Redis.
+  - Middleware: request/response logging, gzip, CORS.
 
-- Database (MongoDB)
-  - `app/database/mongo.py` provides a singleton `mongodb` Motor client used for storing jobs, datasets metadata, and model routing entries.
-  - Collections of interest: `fine_tuning_jobs`, `fine_tuning_datasets`, `model_routing`, `client_config`.
+- Persistent Storage
+  - DFS (local filesystem under `DFS_BASE_PATH`) — used for temporary and persisted dataset and model files.
+  - S3 (optional) — long-term object store for datasets and model artifacts.
+  - MongoDB — stores job metadata (`fine_tuning_jobs`), dataset metadata (`fine_tuning_datasets`), model routing (`model_routing`) and client configs.
 
-- Cache (Redis)
-  - `app/database/redis.py` provides `AsyncRedisClientConfigManager` which caches per-client configuration (`client_config`) with TTL and fallback to MongoDB.
+- Cache
+  - Redis — TTL-based cache for `client_config`; reduces read load on MongoDB.
 
-- Object Storage (S3 / DFS)
-  - Datasets uploaded via API are saved to a local DFS path (configurable via DFS_BASE_PATH) and optionally uploaded to S3 using `app/clients/boto.py`.
-  - `FineTuningService` persists dataset metadata in MongoDB.
+- Training / Orchestration
+  - Ray cluster (optional) — receives job submissions via JobSubmissionClient or a fallback remote task; executes distributed training workloads.
+  - `fine_tuning_script.py` — training entrypoint executed by Ray or local fallback.
 
-- Fine-tuning orchestration
-  - `app/services/fine_tuning/service.py` handles dataset saves, dataset metadata persistence, job creation and resource estimation, and enqueues background processing.
-  - Background execution tries to submit jobs to Ray via `app/clients/ray_fine_tuning.py`. If Ray is unavailable, it falls back to local simulation.
-  - Jobs are persisted in MongoDB and kept updated with status and any Ray job id.
+- Model Serving
+  - Kubernetes cluster running model servers (vLLM server image). Each deployed model has:
+    - Deployment (Pod with GPU requests/limits)
+    - Service (ClusterIP)
+    - KEDA ScaledObject (prometheus-triggered autoscaling)
+    - Optional PVC for fine-tuned weights
+  - Model registry in MongoDB maps model names + client to service URL, used by the inference proxy.
 
-- Ray client
-  - `app/clients/ray_fine_tuning.py` wraps Ray initialization and job submission (JobSubmissionClient or a task fallback). It provides cluster resource queries and job status lookups.
+- Observability & Autoscaling
+  - Prometheus metrics (expected metric: `vllm:num_requests_waiting`) are used by KEDA to autoscale replicas.
+  - Structured file-based logs for API requests and DB operations.
 
-- Inference / Deployment (Kubernetes)
-  - `app/services/inference/service.py` contains logic to deploy base and fine-tuned models to Kubernetes by creating Deployments, Services, PVCs and KEDA ScaledObjects.
-  - Deployed model routing information is stored in MongoDB (`model_routing`) so the API can reverse-proxy inference requests to the correct service URL.
-  - Inference proxy uses `httpx` to forward requests to the model service's /predict endpoint.
+Primary data flows
 
-- Clients & utilities
-  - `app/clients/boto.py` — S3 client wrapper.
-  - `utility/utils.py` — small helpers (e.g., current UTC time) used by the logging middleware.
+1. Dataset upload
+   - Client POSTs multipart file to `/fine_tuning/upload-dataset/{client_code}`.
+   - Service saves file to DFS, optionally uploads to S3, persists metadata to `fine_tuning_datasets` collection.
 
-- Logging
-  - `app/middleware/logger/logging.py` implements JSON file logging with daily files, and middleware that logs incoming requests, outgoing responses, and database operations. Uses contextvars to propagate request_id.
+2. Submit fine-tune job
+   - Client POSTs job spec to `/fine_tuning/submit-finetune`.
+   - Backend validates payload, estimates resources, creates `fine_tuning_jobs` doc, enqueues background task.
+   - Background task attempts to submit a Ray job (JobSubmissionClient) with an entrypoint that points to `fine_tuning_script.py` and dataset path.
+   - Ray workers execute training and write checkpoints to DFS/S3; job status updated in MongoDB (job_id / ray_job_id).
 
-Data flow for a fine-tuning job
+3. Deploy model
+   - Client calls `/inference/deploy/fine_tuned` or `/inference/deploy/base`.
+   - InferenceService creates Deployment, Service, (PVC if needed) and KEDA ScaledObject.
+   - Service URL and routing info are persisted in `model_routing` collection.
 
-1. Client uploads a dataset via /fine_tuning/upload-dataset -> saved to DFS and S3, metadata persisted to `fine_tuning_datasets`.
-2. Client calls /fine_tuning/submit-finetune with dataset reference and hyperparameters.
-3. Service computes resource estimates, persists a `fine_tuning_jobs` document and enqueues background processing.
-4. Background task tries to submit a Ray job to run the training entrypoint (FINETUNING_SCRIPT_PATH). Ray returns a job id recorded in the job doc.
-5. After training completes the fine-tuned artifact is available (via DFS/S3). A user may deploy it via /inference/deploy/fine_tuned.
-6. The deployed service is recorded in `model_routing` and inference requests are proxied to it.
+4. Inference
+   - Client POSTs to `/inference/infer/{model_name}`.
+   - API looks up routing (client-specific if X-User-ID provided), proxies request to model service `/predict` endpoint, returns response.
 
-Resilience and fallbacks
+Deployment topology and recommendations
 
-- If MongoDB is unavailable, the fine-tuning service falls back to an in-memory job cache.
-- If Ray is unavailable, job processing can be simulated locally or run via a Ray task fallback.
-- Redis caching is best-effort: on cache misses the system queries MongoDB and refreshes Redis.
+- Separate clusters (or namespaces) are recommended:
+  - Training workload cluster (Ray) — optimized for GPU training nodes.
+  - Inference cluster (Kubernetes) — optimized for GPU/CPU inference with device plugin + KEDA.
 
-Security and considerations
+- Networking
+  - Internal DNS/service discovery used for model routing (ClusterIP `service_name.default.svc.cluster.local`).
+  - Protect external endpoints with an API gateway (ingress) and authentication.
 
-- Credentials and cluster config are loaded from env files (see `configs/envs.py`). Keep these files secure.
-- Kubernetes and Ray interactions use local kubeconfig or in-cluster config depending on runtime.
+Resource & scaling guidance
 
-Where to look in code
+- Estimate GPU requirements conservatively (service estimates assume 48GB GPU memory per unit).
+- Use KEDA + Prometheus metrics for autoscaling; tune `prometheus_threshold` per model type and traffic patterns.
+- Use PVCs for per-client model artifacts if model files must be mounted; prefer S3 for portability when possible.
 
-- `main.py` — app initialization and middleware
-- `app/services/fine_tuning` — fine-tuning API and service logic
-- `app/services/inference` — deployment and inference proxy
-- `app/database` — mongo and redis helpers
-- `app/clients` — S3 and Ray utility wrappers
-- `app/middleware/logger` — structured logging and middleware
+Failure modes & mitigation
+
+- MongoDB down: service falls back to in-memory cache for jobs but loses persistence. Mitigation: Mongo primary/replica sets and backups.
+- Redis down: increased MongoDB latency; Redis should be deployed as a durable cluster with persistence if used in production.
+- Ray unavailable: background job submission falls back to local simulation — monitor and alert for Ray health.
+- Kubernetes API errors (ApiException): bubble up to clients as 500; capture events and kube-apiserver logs for diagnostics.
+
+Security considerations
+
+- Secure `.env` and kubeconfig; use secret management (Kubernetes Secrets, Vault) for credentials.
+- Add authentication & authorization to API endpoints (JWT/OAuth or mTLS via ingress).
+- Limit RBAC permissions given to the service account that operates Kubernetes objects.
+
+Recommended improvements (short roadmap)
+
+1. Add an API gateway (ingress) with auth and rate-limiting.
+2. Implement synchronous/asynchronous job status callbacks (webhooks) and a retry strategy for failed submissions.
+3. Replace DFS local paths with a shared POSIX store (NFS) or use S3-backed storage for reproducibility across cluster nodes.
+4. Add readiness/liveness probes for long-running background tasks and model deployments.
+5. Add integration tests and a Postman/OpenAPI collection for easier onboarding.
+
+Appendix: quick reference to drawio elements
+
+- FastAPI (API entrypoint) → Ray (Job submission) → Ray workers execute training → write checkpoints to S3/DFS → FastAPI triggers Kubernetes deploy → vLLM pods serve requests → registry in MongoDB used by API to proxy inference.
+
+If you want, I can: generate a cleaned drawio export (SVG or updated .drawio) with labeled zones (training vs inference clusters), or produce a Mermaid diagram for README/docs. Which would you prefer next?
