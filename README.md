@@ -122,7 +122,3 @@ Inference API (/inference)
 ## Contributing
 
 Follow existing code patterns. The project uses a singleton pattern for infra clients (MongoDB, Redis, S3, Ray). Logging uses structured JSON files in `logs/`.
-
-## License
-
-(If applicable) Add your license here.
