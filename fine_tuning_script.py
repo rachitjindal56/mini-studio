@@ -1,3 +1,4 @@
+import weave
 import argparse
 import os
 from pathlib import Path
@@ -7,6 +8,7 @@ import requests
 from unsloth.trainer import Trainer
 from unsloth.data import Dataset
 
+weave.init("q3")
 parser = argparse.ArgumentParser()
 parser.add_argument("--model", type=str, required=True, help="Base model name or path")
 parser.add_argument("--dataset_path", type=str, required=True, help="Path in DFS to JSONL dataset")
